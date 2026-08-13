@@ -29,11 +29,36 @@ assert_equals "Config parses severity-threshold" "critical" "$CFG_SEVERITY_THRES
 assert_equals "Config parses languages" "go,python" "$CFG_LANGUAGES"
 assert_equals "Config parses exclude-dirs" "test/fixtures,examples/insecure" "$CFG_EXCLUDE_DIRS"
 assert_equals "Config parses exclude-patterns" "insecure-skip-verify,verify-false" "$CFG_EXCLUDE_PATTERNS"
+assert_equals "Config without severity-overrides returns empty" "" "$CFG_SEVERITY_OVERRIDES"
+
+# Test: Unknown key produces warning with suggestion
+TEMP_UNKNOWN=$(mktemp)
+cat >"$TEMP_UNKNOWN" <<'EOF'
+sevrity-threshold: high
+languages:
+  - go
+EOF
+
+output=$(parse_config_file "$TEMP_UNKNOWN" 2>&1)
+assert_contains "Unknown key warns with suggestion" "did you mean" "$output"
+assert_contains "Unknown key suggests correct key" "severity-threshold" "$output"
+rm -f "$TEMP_UNKNOWN"
+
+# Test: Completely unknown key lists valid keys
+TEMP_BOGUS=$(mktemp)
+cat >"$TEMP_BOGUS" <<'EOF'
+foobar: true
+EOF
+
+output=$(parse_config_file "$TEMP_BOGUS" 2>&1)
+assert_contains "Unknown key lists valid keys" "valid keys:" "$output"
+rm -f "$TEMP_BOGUS"
 
 # Test: Missing config file returns defaults
 parse_config_file "/nonexistent/file.yml"
 assert_equals "Missing config returns empty severity" "" "$CFG_SEVERITY_THRESHOLD"
 assert_equals "Missing config returns empty languages" "" "$CFG_LANGUAGES"
+assert_equals "Missing config returns empty severity-overrides" "" "$CFG_SEVERITY_OVERRIDES"
 
 # Test: Merge config with inputs
 export INPUT_SEVERITY_THRESHOLD="high"
@@ -64,6 +89,122 @@ merge_config
 assert_equals "Merge uses input severity when non-default" "medium" "$SEVERITY_THRESHOLD"
 assert_equals "Merge uses input languages when non-auto" "cpp" "$LANGUAGES"
 
+# Test: Parse exceptions from config
+TEMP_EXCEPTIONS=$(mktemp)
+cat >"$TEMP_EXCEPTIONS" <<'EOF'
+severity-threshold: high
+exceptions:
+  - insecure-skip-verify:test_helpers.go
+  - min-version-tls10:internal/legacy/
+EOF
+
+parse_config_file "$TEMP_EXCEPTIONS"
+assert_contains "Config parses exceptions (file entry)" "insecure-skip-verify:test_helpers.go" "$CFG_EXCEPTIONS"
+assert_contains "Config parses exceptions (dir entry)" "min-version-tls10:internal/legacy/" "$CFG_EXCEPTIONS"
+
+# Test: Exceptions are exported via merge_config
+export INPUT_SEVERITY_THRESHOLD="high"
+export INPUT_LANGUAGES="auto"
+export INPUT_EXCLUDE_DIRS=""
+export INPUT_EXCLUDE_PATTERNS=""
+export INPUT_CONFIG_FILE="$TEMP_EXCEPTIONS"
+export INPUT_SCAN_PATH="."
+export INPUT_FAIL_ON_FINDINGS="true"
+export INPUT_SARIF_OUTPUT=""
+
+merge_config
+assert_contains "Merge exports exceptions" "insecure-skip-verify:test_helpers.go" "$EXCEPTIONS"
+
+rm -f "$TEMP_EXCEPTIONS"
+
+# Test: Parse severity-overrides from config
+TEMP_OVERRIDES=$(mktemp)
+cat >"$TEMP_OVERRIDES" <<'EOF'
+severity-threshold: high
+severity-overrides:
+  - hardcoded-tls-config:high
+  - prefer-server-cipher-suites:info
+EOF
+
+parse_config_file "$TEMP_OVERRIDES"
+assert_contains "Config parses severity-overrides (first entry)" "hardcoded-tls-config:high" "$CFG_SEVERITY_OVERRIDES"
+assert_contains "Config parses severity-overrides (second entry)" "prefer-server-cipher-suites:info" "$CFG_SEVERITY_OVERRIDES"
+
+# Test: Severity overrides are exported via merge_config
+export INPUT_SEVERITY_THRESHOLD="high"
+export INPUT_LANGUAGES="auto"
+export INPUT_EXCLUDE_DIRS=""
+export INPUT_EXCLUDE_PATTERNS=""
+export INPUT_CONFIG_FILE="$TEMP_OVERRIDES"
+export INPUT_SCAN_PATH="."
+export INPUT_FAIL_ON_FINDINGS="true"
+export INPUT_SARIF_OUTPUT=""
+
+merge_config
+assert_contains "Merge exports severity overrides" "hardcoded-tls-config:high" "$SEVERITY_OVERRIDES"
+
+rm -f "$TEMP_OVERRIDES"
+
+# Test: Exclude-patterns merge (union of input + config)
+TEMP_MERGE_PAT=$(mktemp)
+cat >"$TEMP_MERGE_PAT" <<'EOF'
+exclude-patterns:
+  - verify-false
+  - cert-none
+EOF
+
+export INPUT_SEVERITY_THRESHOLD="high"
+export INPUT_LANGUAGES="auto"
+export INPUT_EXCLUDE_DIRS=""
+export INPUT_EXCLUDE_PATTERNS="insecure-skip-verify"
+export INPUT_CONFIG_FILE="$TEMP_MERGE_PAT"
+export INPUT_SCAN_PATH="."
+export INPUT_FAIL_ON_FINDINGS="true"
+export INPUT_SARIF_OUTPUT=""
+
+merge_config
+assert_contains "Merge unions exclude-patterns (input)" "insecure-skip-verify" "$EXCLUDE_PATTERNS"
+assert_contains "Merge unions exclude-patterns (config)" "verify-false" "$EXCLUDE_PATTERNS"
+assert_contains "Merge unions exclude-patterns (config 2)" "cert-none" "$EXCLUDE_PATTERNS"
+rm -f "$TEMP_MERGE_PAT"
+
+# Test: Inline key:value syntax in config
+TEMP_INLINE=$(mktemp)
+cat >"$TEMP_INLINE" <<'EOF'
+severity-threshold: medium
+languages: go,rust
+exclude-dirs: vendor,tmp
+EOF
+
+parse_config_file "$TEMP_INLINE"
+assert_equals "Inline syntax parses severity-threshold" "medium" "$CFG_SEVERITY_THRESHOLD"
+assert_contains "Inline syntax parses languages (go)" "go" "$CFG_LANGUAGES"
+assert_contains "Inline syntax parses languages (rust)" "rust" "$CFG_LANGUAGES"
+assert_contains "Inline syntax parses exclude-dirs (vendor)" "vendor" "$CFG_EXCLUDE_DIRS"
+assert_contains "Inline syntax parses exclude-dirs (tmp)" "tmp" "$CFG_EXCLUDE_DIRS"
+rm -f "$TEMP_INLINE"
+
+# Test: REPORT_OUTPUT pass-through via merge_config
+TEMP_RPT=$(mktemp)
+cat >"$TEMP_RPT" <<'EOF'
+severity-threshold: high
+EOF
+
+export INPUT_SEVERITY_THRESHOLD="high"
+export INPUT_LANGUAGES="auto"
+export INPUT_EXCLUDE_DIRS=""
+export INPUT_EXCLUDE_PATTERNS=""
+export INPUT_CONFIG_FILE="$TEMP_RPT"
+export INPUT_SCAN_PATH="."
+export INPUT_FAIL_ON_FINDINGS="true"
+export INPUT_SARIF_OUTPUT=""
+export INPUT_REPORT_OUTPUT="report.csv"
+
+merge_config
+assert_equals "Merge exports REPORT_OUTPUT" "report.csv" "$REPORT_OUTPUT"
+unset INPUT_REPORT_OUTPUT
+rm -f "$TEMP_RPT"
+
 # Cleanup
 rm -f "$TEMP_CONFIG"
 
@@ -77,6 +218,8 @@ run_validate() {
 		LANGUAGES="$2"
 		FAIL_ON_FINDINGS="$3"
 		SCAN_PATH="$4"
+		SEVERITY_OVERRIDES="${5:-}"
+		REPORT_OUTPUT="${6:-}"
 		validate_config 2>/dev/null
 	)
 }
@@ -107,6 +250,40 @@ if run_validate "high" "auto" "true" "/nonexistent/path"; then
 	assert_equals "Invalid scan path rejected" "should_fail" "passed"
 else
 	assert_equals "Invalid scan path rejected" "true" "true"
+fi
+
+# Test: Invalid severity override is rejected
+if run_validate "high" "auto" "true" "." "insecure-skip-verify:crtical"; then
+	assert_equals "Invalid severity override rejected" "should_fail" "passed"
+else
+	assert_equals "Invalid severity override rejected" "true" "true"
+fi
+
+# Test: Valid severity override passes validation
+if run_validate "high" "auto" "true" "." "insecure-skip-verify:medium"; then
+	assert_equals "Valid severity override passes validation" "true" "true"
+else
+	assert_equals "Valid severity override passes validation" "true" "false"
+fi
+
+# Test: Invalid report-output extension is rejected
+if run_validate "high" "auto" "true" "." "" "report.txt"; then
+	assert_equals "Invalid report-output extension rejected" "should_fail" "passed"
+else
+	assert_equals "Invalid report-output extension rejected" "true" "true"
+fi
+
+# Test: Valid report-output extensions pass validation
+if run_validate "high" "auto" "true" "." "" "report.json"; then
+	assert_equals "Valid .json report-output passes" "true" "true"
+else
+	assert_equals "Valid .json report-output passes" "true" "false"
+fi
+
+if run_validate "high" "auto" "true" "." "" "report.csv"; then
+	assert_equals "Valid .csv report-output passes" "true" "true"
+else
+	assert_equals "Valid .csv report-output passes" "true" "false"
 fi
 
 # Test: Valid config passes validation

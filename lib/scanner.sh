@@ -4,12 +4,19 @@
 set -euo pipefail
 
 # Global findings storage
-# Each finding: "id|severity|name|description|file|line|match"
+# Each finding: "id|severity|name|description|file|line|match|col"
 FINDINGS=()
+# Parallel array: regex that matched each finding (same indices as FINDINGS)
+FINDING_REGEXES=()
 CRITICAL_COUNT=0
 HIGH_COUNT=0
 MEDIUM_COUNT=0
 INFO_COUNT=0
+
+# Exclusion audit tracking
+EXCLUDED_PATTERNS_USED=""
+EXCEPTIONS_USED=""
+INLINE_SUPPRESSION_COUNT=0
 
 # Build grep --include flags for a language
 build_include_flags() {
@@ -69,6 +76,89 @@ build_common_exclude_dirs() {
 	echo "$flags"
 }
 
+# Check if a pattern+file combination is excluded via per-path exceptions
+is_path_excluded() {
+	local pattern_id="$1"
+	local file="$2"
+	local exceptions="$3"
+
+	if [[ -z "$exceptions" ]]; then
+		return 1
+	fi
+
+	IFS=',' read -ra entries <<<"$exceptions"
+	for entry in "${entries[@]}"; do
+		entry="${entry// /}"
+		local exc_pattern="${entry%%:*}"
+		local exc_path="${entry#*:}"
+
+		if [[ "$exc_pattern" != "$pattern_id" ]]; then
+			continue
+		fi
+
+		# Directory prefix match (path ends with /)
+		if [[ "$exc_path" == */ ]] && [[ "$file" == "$exc_path"* ]]; then
+			return 0
+		fi
+
+		# Exact file match or glob match
+		# shellcheck disable=SC2053  # Unquoted RHS is intentional for glob matching
+		if [[ "$file" == $exc_path ]]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+is_line_suppressed() {
+	local pattern_id="$1"
+	local line="$2"
+
+	if [[ "$line" != *"tls-lint:ignore"* ]]; then
+		return 1
+	fi
+
+	# Targeted: tls-lint:ignore:pattern-id (anchored to avoid substring matches)
+	local directive="tls-lint:ignore:${pattern_id}"
+	if [[ "$line" == *"${directive}"* ]]; then
+		local after="${line#*"${directive}"}"
+		if [[ -z "$after" || "${after:0:1}" == [[:space:]] || "${after:0:1}" == "," ]]; then
+			return 0
+		fi
+	fi
+
+	# Blanket: tls-lint:ignore (not followed by :)
+	if [[ "$line" != *"tls-lint:ignore:"* ]]; then
+		return 0
+	fi
+
+	return 1
+}
+
+# Look up a severity override for a pattern ID
+get_severity_override() {
+	local pattern_id="$1"
+	local overrides="$2"
+
+	if [[ -z "$overrides" ]]; then
+		echo ""
+		return
+	fi
+
+	IFS=',' read -ra entries <<<"$overrides"
+	for entry in "${entries[@]}"; do
+		entry="${entry// /}"
+		local ovr_pattern="${entry%%:*}"
+		local ovr_severity="${entry#*:}"
+
+		if [[ "$ovr_pattern" == "$pattern_id" ]]; then
+			echo "$ovr_severity"
+			return
+		fi
+	done
+	echo ""
+}
+
 # Check if a pattern ID is excluded
 is_pattern_excluded() {
 	local pattern_id="$1"
@@ -103,6 +193,11 @@ scan_pattern() {
 	# Skip excluded patterns
 	if is_pattern_excluded "$pattern_id" "$exclude_patterns"; then
 		log_debug "Skipping excluded pattern: $pattern_id"
+		if [[ -z "$EXCLUDED_PATTERNS_USED" ]]; then
+			EXCLUDED_PATTERNS_USED="$pattern_id"
+		elif [[ ",$EXCLUDED_PATTERNS_USED," != *",$pattern_id,"* ]]; then
+			EXCLUDED_PATTERNS_USED="${EXCLUDED_PATTERNS_USED},${pattern_id}"
+		fi
 		return 0
 	fi
 
@@ -116,28 +211,63 @@ scan_pattern() {
 	# Run grep from inside scan_path so --exclude-dir won't match the scan root itself
 	local grep_output
 	# shellcheck disable=SC2086
-	grep_output=$(cd "$scan_path" && grep -rn $include_flags $exclude_test_flags $lang_exclude_dirs $common_exclude_dirs \
+	grep_output=$(cd "$scan_path" && grep -rnI $include_flags $exclude_test_flags $lang_exclude_dirs $common_exclude_dirs \
 		-E "$regex" . 2>/dev/null) || true
 
 	if [[ -z "$grep_output" ]]; then
 		return 0
 	fi
 
+	# Apply per-pattern severity override (once, before the match loop)
+	local override
+	override=$(get_severity_override "$pattern_id" "${SEVERITY_OVERRIDES:-}")
+	if [[ -n "$override" ]]; then
+		severity="$override"
+	fi
+
 	# Parse grep output lines: ./file:line:match
 	while IFS= read -r match_line; do
 		local file line_num match_text
-		# Extract file path (everything before first colon-number-colon)
-		file=$(echo "$match_line" | sed -E 's/:([0-9]+):.*$//')
-		line_num=$(echo "$match_line" | sed -E 's/^[^:]+:([0-9]+):.*$/\1/')
-		match_text=$(echo "$match_line" | sed -E 's/^[^:]+:[0-9]+://')
+		if [[ "$match_line" =~ ^(.*):([0-9]+):(.*)$ ]]; then
+			file="${BASH_REMATCH[1]}"
+			line_num="${BASH_REMATCH[2]}"
+			match_text="${BASH_REMATCH[3]}"
+		else
+			continue
+		fi
 
 		# Strip leading ./ from file path
 		file="${file#./}"
 
-		# Trim match text for readability
-		match_text=$(echo "$match_text" | sed 's/^[[:space:]]*//' | cut -c1-200)
+		# Skip if this pattern+file is excepted
+		if is_path_excluded "$pattern_id" "$file" "${EXCEPTIONS:-}"; then
+			local exc_entry="${pattern_id}:${file}"
+			if [[ -z "$EXCEPTIONS_USED" ]]; then
+				EXCEPTIONS_USED="$exc_entry"
+			elif [[ ",$EXCEPTIONS_USED," != *",$exc_entry,"* ]]; then
+				EXCEPTIONS_USED="${EXCEPTIONS_USED},${exc_entry}"
+			fi
+			continue
+		fi
 
-		FINDINGS+=("${pattern_id}|${severity}|${name}|${description}|${file}|${line_num}|${match_text}")
+		# Skip if line has inline suppression comment
+		if is_line_suppressed "$pattern_id" "$match_text"; then
+			INLINE_SUPPRESSION_COUNT=$((INLINE_SUPPRESSION_COUNT + 1))
+			continue
+		fi
+
+		# Compute column offset before stripping whitespace
+		local leading="${match_text%%[![:space:]]*}"
+		local col=$((${#leading} + 1))
+		match_text="${match_text#"${leading}"}"
+		match_text="${match_text:0:200}"
+
+		FINDINGS+=("${pattern_id}|${severity}|${name}|${description}|${file}|${line_num}|${match_text}|${col}")
+		FINDING_REGEXES+=("$regex")
+
+		log_debug "Finding: $pattern_id in $file:$line_num"
+		log_debug "  Regex: $regex"
+		log_debug "  Match: $match_text"
 
 		# Update severity counters
 		case "$(normalize_severity "$severity")" in
@@ -159,7 +289,7 @@ filter_go_tls_config_noise() {
 	# Check if there are any "hardcoded-tls-config" findings
 	local has_tls_config=false
 	for finding in "${FINDINGS[@]}"; do
-		IFS='|' read -r fid _ _ _ _ _ _ <<<"$finding"
+		IFS='|' read -r fid _ _ _ _ _ _ _ <<<"$finding"
 		if [[ "$fid" == "hardcoded-tls-config" ]]; then
 			has_tls_config=true
 			break
@@ -173,7 +303,7 @@ filter_go_tls_config_noise() {
 	# Check if any Go files reference TLSSecurityProfile
 	local profile_files
 	# shellcheck disable=SC2086
-	profile_files=$(cd "$scan_path" && grep -rl --include="*.go" $common_exclude_dirs \
+	profile_files=$(cd "$scan_path" && grep -rlI --include="*.go" $common_exclude_dirs \
 		--exclude="*_test.go" "TLSSecurityProfile" . 2>/dev/null) || true
 
 	if [[ -z "$profile_files" ]]; then
@@ -182,13 +312,16 @@ filter_go_tls_config_noise() {
 
 	# Filter findings: remove hardcoded-tls-config entries where file also references TLSSecurityProfile
 	local filtered_findings=()
+	local filtered_regexes=()
+	local i=0
 	for finding in "${FINDINGS[@]}"; do
-		IFS='|' read -r fid fsev _ _ ffile _ _ <<<"$finding"
+		IFS='|' read -r fid fsev _ _ ffile _ _ _ <<<"$finding"
 		if [[ "$fid" == "hardcoded-tls-config" ]]; then
 			local full_path="$scan_path/$ffile"
 			# Keep finding only if file does NOT reference TLSSecurityProfile
-			if ! grep -q "TLSSecurityProfile" "$full_path" 2>/dev/null; then
+			if ! grep -qI "TLSSecurityProfile" "$full_path" 2>/dev/null; then
 				filtered_findings+=("$finding")
+				filtered_regexes+=("${FINDING_REGEXES[$i]}")
 			else
 				log_debug "Filtered tls.Config finding in $ffile (uses TLSSecurityProfile)"
 				# Decrement counter
@@ -201,10 +334,13 @@ filter_go_tls_config_noise() {
 			fi
 		else
 			filtered_findings+=("$finding")
+			filtered_regexes+=("${FINDING_REGEXES[$i]}")
 		fi
+		i=$((i + 1))
 	done
 
 	FINDINGS=("${filtered_findings[@]+"${filtered_findings[@]}"}")
+	FINDING_REGEXES=("${filtered_regexes[@]+"${filtered_regexes[@]}"}")
 }
 
 # Scan all patterns for a language
@@ -242,7 +378,12 @@ scan_language() {
 		*) return 0 ;;
 	esac
 
-	# Use eval to iterate the named array (compatible with bash 3.x+)
+	# Validate variable name before eval (bash 3.x lacks declare -n)
+	if [[ ! "$patterns_var" =~ ^[A-Z_]+$ ]]; then
+		log_error "Invalid patterns variable name: $patterns_var"
+		return 1
+	fi
+
 	local pattern_line
 	eval 'for pattern_line in "${'"$patterns_var"'[@]}"; do
 		scan_pattern "$scan_path" "$lang" "$pattern_line" "$exclude_dirs" "$exclude_patterns"

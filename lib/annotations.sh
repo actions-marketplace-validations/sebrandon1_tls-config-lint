@@ -1,31 +1,75 @@
 #!/usr/bin/env bash
-# annotations.sh - GitHub Actions ::error/::warning/::notice emitter
+# annotations.sh - Finding emitter (GitHub annotations or colored terminal output)
 
 set -euo pipefail
 
-# Emit GitHub Actions annotations for all findings
+# Emit findings as GitHub annotations or colored terminal lines
 emit_annotations() {
 	if [[ ${#FINDINGS[@]} -eq 0 ]]; then
 		return 0
 	fi
 
-	for finding in "${FINDINGS[@]}"; do
-		# shellcheck disable=SC2034  # match_text unused here but needed for field parsing
-		IFS='|' read -r pattern_id severity name description file line_num match_text <<<"$finding"
+	if [[ "$CLI_MODE" == "true" ]]; then
+		emit_annotations_cli
+	else
+		emit_annotations_gha
+	fi
+}
 
-		local sev_lower
-		sev_lower=$(normalize_severity "$severity")
+emit_annotations_gha() {
+	local i=0
+	for finding in "${FINDINGS[@]}"; do
+		IFS='|' read -r pattern_id severity name description file line_num match_text _ <<<"$finding"
 
 		local annotation_type
-		case "$sev_lower" in
-			critical | high) annotation_type="error" ;;
-			medium) annotation_type="warning" ;;
-			info) annotation_type="notice" ;;
-			*) annotation_type="notice" ;;
-		esac
+		annotation_type=$(severity_to_sarif_level "$severity")
+		[[ "$annotation_type" == "note" ]] && annotation_type="notice"
 
-		local message="[${severity}] ${name}: ${description}"
+		local docs_url
+		docs_url=$(pattern_docs_url "$pattern_id" "$file")
+		local message="[${severity}] ${name}: ${description} (docs: ${docs_url})"
+		if [[ -n "${DEBUG:-}" ]]; then
+			message="${message} | match: ${match_text}"
+			local finding_regex="${FINDING_REGEXES[$i]:-}"
+			if [[ -n "$finding_regex" ]]; then
+				message="${message} | regex: ${finding_regex}"
+			fi
+		fi
 
 		echo "::${annotation_type} file=${file},line=${line_num},title=TLS Config Lint (${pattern_id})::${message}"
+		i=$((i + 1))
+	done
+}
+
+emit_annotations_cli() {
+	echo ""
+	echo -e "${COLOR_BOLD}Findings:${COLOR_RESET}"
+	echo ""
+
+	local i=0
+	for finding in "${FINDINGS[@]}"; do
+		IFS='|' read -r pattern_id severity name description file line_num match_text _ <<<"$finding"
+
+		local sev_lower color
+		sev_lower=$(normalize_severity "$severity")
+
+		case "$sev_lower" in
+			critical | high) color="$COLOR_RED" ;;
+			medium) color="$COLOR_YELLOW" ;;
+			*) color="$COLOR_BLUE" ;;
+		esac
+
+		local docs_url
+		docs_url=$(pattern_docs_url "$pattern_id" "$file")
+		echo -e "  ${color}[${severity}]${COLOR_RESET} ${file}:${line_num} — ${COLOR_BOLD}${name}${COLOR_RESET}: ${description}"
+		echo -e "    ${COLOR_DIM}Docs: ${docs_url}${COLOR_RESET}"
+		if [[ -n "${DEBUG:-}" ]]; then
+			echo -e "    ${COLOR_DIM}Match: ${match_text}${COLOR_RESET}"
+			local finding_regex="${FINDING_REGEXES[$i]:-}"
+			if [[ -n "$finding_regex" ]]; then
+				echo -e "    ${COLOR_DIM}Regex: ${finding_regex}${COLOR_RESET}"
+			fi
+		fi
+		i=$((i + 1))
 	done
 }

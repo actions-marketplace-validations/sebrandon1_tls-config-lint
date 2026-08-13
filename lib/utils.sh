@@ -3,6 +3,35 @@
 
 set -euo pipefail
 
+# CLI mode: auto-detect when running outside GitHub Actions
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+	CLI_MODE=false
+else
+	CLI_MODE=true
+fi
+
+# Terminal colors (only when stdout is a tty)
+# shellcheck disable=SC2034  # COLOR_* variables used by annotations.sh and summary.sh
+if [[ -t 1 ]] && [[ "$CLI_MODE" == "true" ]]; then
+	COLOR_RED='\033[0;31m'
+	COLOR_YELLOW='\033[0;33m'
+	COLOR_BLUE='\033[0;34m'
+	COLOR_BOLD='\033[1m'
+	COLOR_DIM='\033[2m'
+	COLOR_RESET='\033[0m'
+else
+	COLOR_RED=''
+	COLOR_YELLOW=''
+	COLOR_BLUE=''
+	COLOR_BOLD=''
+	COLOR_DIM=''
+	COLOR_RESET=''
+fi
+
+get_tool_version() {
+	git describe --tags --always 2>/dev/null || echo "unknown"
+}
+
 # Normalize severity string to lowercase
 normalize_severity() {
 	echo "$1" | tr '[:upper:]' '[:lower:]'
@@ -21,6 +50,15 @@ severity_level() {
 	esac
 }
 
+severity_to_sarif_level() {
+	case "$(normalize_severity "$1")" in
+		critical | high) echo "error" ;;
+		medium) echo "warning" ;;
+		info) echo "note" ;;
+		*) echo "note" ;;
+	esac
+}
+
 # Check if severity meets or exceeds threshold
 # Returns 0 (true) if finding_severity >= threshold_severity
 meets_threshold() {
@@ -34,19 +72,37 @@ meets_threshold() {
 
 # Logging helpers
 log_info() {
-	echo "::notice::$*"
+	if [[ "$CLI_MODE" == "true" ]]; then
+		echo -e "${COLOR_BLUE}[INFO]${COLOR_RESET} $*"
+	else
+		echo "::notice::$*"
+	fi
 }
 
 log_warning() {
-	echo "::warning::$*"
+	if [[ "$CLI_MODE" == "true" ]]; then
+		echo -e "${COLOR_YELLOW}[WARN]${COLOR_RESET} $*"
+	else
+		echo "::warning::$*"
+	fi
 }
 
 log_error() {
-	echo "::error::$*"
+	if [[ "$CLI_MODE" == "true" ]]; then
+		echo -e "${COLOR_RED}[ERROR]${COLOR_RESET} $*"
+	else
+		echo "::error::$*"
+	fi
 }
 
 log_debug() {
-	echo "::debug::$*"
+	if [[ "$CLI_MODE" == "true" ]]; then
+		if [[ -n "${DEBUG:-}" ]]; then
+			echo -e "${COLOR_DIM}[DEBUG]${COLOR_RESET} $*"
+		fi
+	else
+		echo "::debug::$*"
+	fi
 }
 
 # Print to stderr for script diagnostics (not GitHub annotations)
@@ -66,12 +122,38 @@ csv_to_list() {
 in_csv_list() {
 	local needle="$1"
 	local haystack="$2"
+	if [[ -z "$haystack" ]]; then
+		return 1
+	fi
 	local item
 	IFS=',' read -ra items <<<"$haystack"
-	for item in "${items[@]}"; do
+	for item in "${items[@]+"${items[@]}"}"; do
 		if [[ "$item" == "$needle" ]]; then
 			return 0
 		fi
 	done
 	return 1
+}
+
+# Map file extension to language prefix for docs anchors
+file_to_lang_prefix() {
+	case "$1" in
+		*.go) echo "go" ;;
+		*.py) echo "python" ;;
+		*.js | *.mjs | *.ts | *.mts) echo "nodejs" ;;
+		*.cpp | *.cc | *.cxx | *.h | *.hpp) echo "cpp" ;;
+		*.java) echo "java" ;;
+		*.rs) echo "rust" ;;
+		*) echo "" ;;
+	esac
+}
+
+# Build docs URL for a pattern finding
+pattern_docs_url() {
+	local pattern_id="$1"
+	local file="$2"
+	local lang_prefix
+	lang_prefix=$(file_to_lang_prefix "$file")
+	local anchor="${lang_prefix:+${lang_prefix}-}${pattern_id}"
+	echo "https://github.com/sebrandon1/tls-config-lint/blob/main/docs/patterns.md#${anchor}"
 }

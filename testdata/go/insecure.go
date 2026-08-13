@@ -59,6 +59,16 @@ func weakCiphers() *tls.Config {
 	}
 }
 
+func insecureGRPC() {
+	// CRITICAL: gRPC without TLS
+	conn, _ := grpc.Dial("localhost:50051", grpc.WithInsecure())
+	_ = conn
+
+	// CRITICAL: gRPC with insecure.NewCredentials()
+	conn2, _ := grpc.Dial("localhost:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	_ = conn2
+}
+
 func oldTLSProfile() {
 	// HIGH: Old TLS profile allows TLS 1.0/1.1
 	profileType := configv1.OldType
@@ -67,4 +77,13 @@ func oldTLSProfile() {
 	// MEDIUM: Custom profile needs review
 	customType := configv1.CustomType
 	_ = customType
+}
+
+func suppressedFindings() {
+	// These lines have inline suppression and should NOT produce findings
+	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} // tls-lint:ignore
+	_ = tr
+
+	cfg := &tls.Config{MinVersion: tls.VersionTLS10} // tls-lint:ignore:min-version-tls10
+	_ = cfg
 }

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # test_utils.sh - Utility function tests
+# shellcheck disable=SC2218  # Functions defined via source in run_tests.sh
 
+# Force GitHub Actions mode first
+GITHUB_ACTIONS=true
 # Source library modules
 source "$ROOT_DIR/lib/utils.sh"
 
@@ -54,3 +57,107 @@ if in_csv_list "rust" "go,python,nodejs"; then
 else
 	assert_equals "in_csv_list rejects missing value" "false" "false"
 fi
+
+# Test: CLI_MODE detection
+assert_equals "GITHUB_ACTIONS=true sets CLI_MODE=false" "false" "$CLI_MODE"
+
+# Test: GHA log functions produce workflow commands
+output=$(log_info "test message")
+assert_contains "GHA log_info produces ::notice" "::notice::" "$output"
+output=$(log_warning "test message")
+assert_contains "GHA log_warning produces ::warning" "::warning::" "$output"
+output=$(log_error "test message")
+assert_contains "GHA log_error produces ::error" "::error::" "$output"
+
+# --- CLI mode log tests ---
+echo "  --- Utils Tests (CLI mode) ---"
+
+unset GITHUB_ACTIONS
+source "$ROOT_DIR/lib/utils.sh"
+
+assert_equals "Unset GITHUB_ACTIONS sets CLI_MODE=true" "true" "$CLI_MODE"
+
+output=$(log_info "test message")
+assert_contains "CLI log_info shows [INFO]" "[INFO]" "$output"
+assert_contains "CLI log_info shows message" "test message" "$output"
+
+output=$(log_warning "test message")
+assert_contains "CLI log_warning shows [WARN]" "[WARN]" "$output"
+
+output=$(log_error "test message")
+assert_contains "CLI log_error shows [ERROR]" "[ERROR]" "$output"
+
+# CLI debug should be silent without DEBUG set
+unset DEBUG
+output=$(log_debug "test message")
+assert_equals "CLI log_debug silent without DEBUG" "" "$output"
+
+# CLI debug should produce output with DEBUG set
+# shellcheck disable=SC2034  # Used by log_debug
+DEBUG=1
+output=$(log_debug "test message")
+assert_contains "CLI log_debug shows [DEBUG] with DEBUG=1" "[DEBUG]" "$output"
+unset DEBUG
+
+# --- severity_to_sarif_level tests ---
+echo "  --- severity_to_sarif_level Tests ---"
+
+assert_equals "sarif_level CRITICAL -> error" "error" "$(severity_to_sarif_level "CRITICAL")"
+assert_equals "sarif_level HIGH -> error" "error" "$(severity_to_sarif_level "HIGH")"
+assert_equals "sarif_level MEDIUM -> warning" "warning" "$(severity_to_sarif_level "MEDIUM")"
+assert_equals "sarif_level INFO -> note" "note" "$(severity_to_sarif_level "INFO")"
+assert_equals "sarif_level unknown -> note" "note" "$(severity_to_sarif_level "bogus")"
+
+# --- severity_level known values ---
+assert_equals "severity_level critical is 4" "4" "$(severity_level "critical")"
+assert_equals "severity_level high is 3" "3" "$(severity_level "high")"
+assert_equals "severity_level medium is 2" "2" "$(severity_level "medium")"
+assert_equals "severity_level info is 1" "1" "$(severity_level "info")"
+
+# --- get_tool_version ---
+tool_ver=$(get_tool_version)
+if [[ -n "$tool_ver" ]]; then
+	assert_equals "get_tool_version returns non-empty" "true" "true"
+else
+	assert_equals "get_tool_version returns non-empty" "true" "false"
+fi
+
+# --- log_msg writes to stderr ---
+output=$(log_msg "stderr test" 2>&1)
+assert_contains "log_msg writes to stderr" "[tls-config-lint]" "$output"
+assert_contains "log_msg includes message" "stderr test" "$output"
+
+# --- log_debug in GHA mode ---
+# shellcheck disable=SC2034  # Used by utils.sh on re-source
+GITHUB_ACTIONS=true
+source "$ROOT_DIR/lib/utils.sh"
+output=$(log_debug "gha debug test")
+assert_contains "GHA log_debug produces ::debug" "::debug::" "$output"
+
+# --- file_to_lang_prefix tests ---
+echo "  --- file_to_lang_prefix Tests ---"
+
+assert_equals "file_to_lang_prefix .go" "go" "$(file_to_lang_prefix "main.go")"
+assert_equals "file_to_lang_prefix .py" "python" "$(file_to_lang_prefix "app.py")"
+assert_equals "file_to_lang_prefix .js" "nodejs" "$(file_to_lang_prefix "server.js")"
+assert_equals "file_to_lang_prefix .ts" "nodejs" "$(file_to_lang_prefix "server.ts")"
+assert_equals "file_to_lang_prefix .cpp" "cpp" "$(file_to_lang_prefix "tls.cpp")"
+assert_equals "file_to_lang_prefix .java" "java" "$(file_to_lang_prefix "Main.java")"
+assert_equals "file_to_lang_prefix .rs" "rust" "$(file_to_lang_prefix "lib.rs")"
+assert_equals "file_to_lang_prefix unknown" "" "$(file_to_lang_prefix "config.yml")"
+
+# --- pattern_docs_url tests ---
+url=$(pattern_docs_url "insecure-skip-verify" "main.go")
+assert_contains "pattern_docs_url has base URL" "docs/patterns.md" "$url"
+assert_contains "pattern_docs_url has Go anchor" "#go-insecure-skip-verify" "$url"
+
+url=$(pattern_docs_url "verify-false" "app.py")
+assert_contains "pattern_docs_url has Python anchor" "#python-verify-false" "$url"
+
+url=$(pattern_docs_url "test-pattern" "config.yml")
+assert_contains "pattern_docs_url bare anchor for unknown ext" "#test-pattern" "$url"
+
+# Restore GitHub Actions mode for subsequent test files
+# shellcheck disable=SC2034  # Used by utils.sh on re-source
+GITHUB_ACTIONS=true
+source "$ROOT_DIR/lib/utils.sh"
